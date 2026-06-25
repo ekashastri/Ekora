@@ -1,0 +1,7 @@
+Session duration: 00:23
+Slides forward: 1
+Slides back: 0
+Voice commands: 0
+Pauses: 8
+Annotations saved: 0
+Top gestures: gesture(17)

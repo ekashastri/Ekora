@@ -1,0 +1,1 @@
+"""Hand Paint application package."""
