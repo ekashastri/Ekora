@@ -78,9 +78,11 @@ class HandLandmarks:
     ----------
     landmarks : list of (x, y) pixel tuples – length 21
     handedness : 'Left' or 'Right'
+    is_ghost : True when landmarks are inferred (persistence window), not live
     """
     landmarks: List[Tuple[int, int]]
     handedness: str = "Right"
+    is_ghost: bool = False
 
 
 @dataclass
@@ -95,13 +97,11 @@ class HandTracker:
     max_num_hands: int = config.MAX_NUM_HANDS
     min_detection_confidence: float = config.MIN_DETECTION_CONFIDENCE
     min_tracking_confidence: float = config.MIN_TRACKING_CONFIDENCE
-    smoothing: float = config.LANDMARK_SMOOTHING
-
     _landmarker: vision.HandLandmarker = field(init=False, repr=False)
     _timestamp_ms: int = field(default=0, init=False, repr=False)
-    _smooth_buffer: List[Optional[Tuple[float, float]]] = field(
-        default_factory=lambda: [None] * 21, init=False, repr=False
-    )
+    # v1.5 – stroke persistence
+    _last_hand: Optional[HandLandmarks] = field(default=None, init=False, repr=False)
+    _last_hand_time: float = field(default=0.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         model_path = ensure_model()
@@ -126,6 +126,13 @@ class HandTracker:
         Detect hand landmarks in a BGR frame.
 
         Returns HandLandmarks or None if no hand is detected.
+
+        v1.5 – Stroke persistence:
+        When landmarks are momentarily lost the last known HandLandmarks object
+        is returned for up to STROKE_PERSISTENCE_TIMEOUT seconds so that a brief
+        tracking gap does not break an active stroke.  The caller can check
+        ``hand.is_ghost`` to know that the landmarks are inferred, not live.
+        After the timeout expires we return None and reset smoothing as before.
         """
         h, w = frame_bgr.shape[:2]
 
@@ -134,11 +141,26 @@ class HandTracker:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
 
         # Monotonically increasing timestamp required for VIDEO mode
-        self._timestamp_ms = int((time.time() - self._start_time) * 1000)
+        now = time.time()
+        self._timestamp_ms = int((now - self._start_time) * 1000)
         result = self._landmarker.detect_for_video(mp_image, self._timestamp_ms)
 
         if not result.hand_landmarks:
-            self._reset_smoothing()
+            # --- Stroke persistence: keep last known landmarks briefly ---
+            if (
+                self._last_hand is not None
+                and now - self._last_hand_time < config.STROKE_PERSISTENCE_TIMEOUT
+            ):
+                # Return the ghost copy; do NOT reset smoothing yet
+                ghost = HandLandmarks(
+                    landmarks=list(self._last_hand.landmarks),
+                    handedness=self._last_hand.handedness,
+                    is_ghost=True,
+                )
+                return ghost
+
+            # Timeout elapsed or no previous hand — truly lost
+            self._last_hand = None
             return None
 
         # Use the first detected hand (single-hand drawing mode)
@@ -153,10 +175,12 @@ class HandTracker:
         for i, lm in enumerate(hand_lm):
             raw_x = lm.x * w
             raw_y = lm.y * h
-            smoothed = self._smooth_point(i, raw_x, raw_y)
-            pixel_landmarks.append((int(smoothed[0]), int(smoothed[1])))
+            pixel_landmarks.append((round(raw_x), round(raw_y)))
 
-        return HandLandmarks(landmarks=pixel_landmarks, handedness=handedness)
+        hand = HandLandmarks(landmarks=pixel_landmarks, handedness=handedness)
+        self._last_hand = hand
+        self._last_hand_time = now
+        return hand
 
     def draw_skeleton(
         self,
@@ -181,23 +205,4 @@ class HandTracker:
         """Release MediaPipe resources."""
         self._landmarker.close()
 
-    # ------------------------------------------------------------------
-    # Smoothing helpers
-    # ------------------------------------------------------------------
 
-    def _smooth_point(self, index: int, x: float, y: float) -> Tuple[float, float]:
-        """Exponential moving average for a single landmark."""
-        prev = self._smooth_buffer[index]
-        if prev is None:
-            self._smooth_buffer[index] = (x, y)
-            return x, y
-
-        alpha = 1.0 - self.smoothing
-        sx = prev[0] + alpha * (x - prev[0])
-        sy = prev[1] + alpha * (y - prev[1])
-        self._smooth_buffer[index] = (sx, sy)
-        return sx, sy
-
-    def _reset_smoothing(self) -> None:
-        """Clear smoothing state when the hand leaves the frame."""
-        self._smooth_buffer = [None] * 21
