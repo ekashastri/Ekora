@@ -135,3 +135,45 @@ def create_camera() -> Camera:
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Threaded camera reader
+# ---------------------------------------------------------------------------
+import threading
+import time
+
+class ThreadedCamera:
+    """
+    Reads camera frames in a daemon thread so the main loop always gets
+    the most recent frame without blocking on VideoCapture.read().
+    """
+
+    def __init__(self, camera: Camera) -> None:
+        self._cam   = camera
+        self._frame = None
+        self._ok    = False
+        self._lock  = threading.Lock()
+        self._stop  = threading.Event()
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    def _reader(self) -> None:
+        while not self._stop.is_set():
+            ok, frame = self._cam.read()
+            if ok:
+                with self._lock:
+                    self._frame = frame
+                    self._ok    = True
+            else:
+                time.sleep(0.01)
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        with self._lock:
+            return self._ok, (self._frame.copy() if self._frame is not None else None)
+
+    def release(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._cam.release()

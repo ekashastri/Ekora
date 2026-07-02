@@ -45,6 +45,13 @@ PINCH_THRESHOLD = 0.05
 FINGER_EXTENDED_RATIO = 0.65
 PALM_OPEN_FINGER_COUNT = 4
 
+# Pan (fist) sensitivity – multiplies raw fingertip delta in pixels.
+PAN_SENSITIVITY = 1.0
+
+# Floating colour palette (peace gesture)
+PALETTE_RADIUS_PX = 150
+PALETTE_SWATCH_RADIUS_PX = 26
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -84,7 +91,7 @@ STROKE_PERSISTENCE_TIMEOUT = 0.20   # 200 ms  (150–250 ms spec)
 # Palm-clear safety (v1.5)
 # ---------------------------------------------------------------------------
 # Seconds the open-palm gesture must remain stable before canvas is cleared.
-PALM_HOLD_DURATION = 0.20           # 200 ms (plus debounce = ~300ms total)
+PALM_HOLD_DURATION = 0.15           # 150 ms hold required (v2.3 spec)
 
 # Maximum normalised hand velocity (per second) allowed during palm hold.
 # Anything above this cancels the confirmation.

@@ -49,7 +49,14 @@ class DrawingCanvas:
         # Transparent-black canvas (black strokes on black = invisible until composited)
         self._canvas = np.zeros((height, width, 3), dtype=np.uint8)
         self._prev_point: Optional[Tuple[int, int]] = None
+        self._second_prev_point: Optional[Tuple[int, int]] = None
         self._color_index = 0
+
+        # Pan offset (pixels) – shifts the canvas view when the user pans
+        # with a closed fist. Drawing coordinates are NOT affected, only
+        # how the buffer is displayed during compositing.
+        self.pan_offset: List[int] = [0, 0]
+        self._pan_prev_point: Optional[Tuple[int, int]] = None
 
         # Shape recognition
         self._stroke_points: List[Tuple[int, int]] = []
@@ -242,11 +249,36 @@ class DrawingCanvas:
     # Drawing operations
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Pan (fist gesture) – moves the canvas view, never draws
+    # ------------------------------------------------------------------
+
+    def start_pan(self, point: Tuple[int, int]) -> None:
+        """Begin a pan gesture at the given pixel coordinate."""
+        self._pan_prev_point = point
+
+    def continue_pan(self, point: Tuple[int, int]) -> None:
+        """Move the canvas view by the delta since the last pan point."""
+        if self._pan_prev_point is None:
+            self._pan_prev_point = point
+            return
+        sens = getattr(config, "PAN_SENSITIVITY", 1.0)
+        dx = int((point[0] - self._pan_prev_point[0]) * sens)
+        dy = int((point[1] - self._pan_prev_point[1]) * sens)
+        self.pan_offset[0] += dx
+        self.pan_offset[1] += dy
+        self._pan_prev_point = point
+
+    def end_pan(self) -> None:
+        """Finish the pan gesture (no accidental strokes are produced)."""
+        self._pan_prev_point = None
+
     def start_stroke(self, point: Tuple[int, int]) -> None:
         """Begin a new stroke at the given pixel coordinate."""
         self.is_dirty = True
         self._current_is_eraser = False
         self._prev_point = self._clamp(point)
+        self._second_prev_point = None
         self._stroke_points = [self._prev_point]
 
     def continue_stroke(self, point: Tuple[int, int], eraser: bool = False) -> None:
@@ -268,32 +300,72 @@ class DrawingCanvas:
         if eraser:
             self._erase_segment(p0, p1)
             self._stroke_points.append(clamped)
+            self._second_prev_point = p0
             self._prev_point = clamped
             return
 
-        # Distance based linear interpolation
-        dx = p1[0] - p0[0]
-        dy = p1[1] - p0[1]
-        dist = math.hypot(dx, dy)
+        # --- Catmull-Rom spline interpolation -----------------------------
+        # Render the segment between the previous raw point (p1_ctrl) and
+        # the newly captured point (p2_ctrl) as a smooth curve instead of a
+        # straight line. This removes the faceted look on circles/spirals
+        # and the jagged breaks on fast curved motion, without waiting for
+        # any future point (so it adds zero extra frames of latency):
+        #   - p0_ctrl: the point before the previous one (real, already
+        #     captured) gives the incoming tangent.
+        #   - p3_ctrl: since the true "next" point doesn't exist yet, it is
+        #     linearly extrapolated from the last two real points. This is
+        #     a cheap, immediate approximation - not a delay - and only
+        #     affects curvature smoothing, never the recorded path.
+        # Every raw point is still appended to self._stroke_points below,
+        # so handwriting/shape recognition keep seeing the full, untouched
+        # capture - only the on-canvas rendering is smoothed.
+        p1_ctrl = p0
+        p2_ctrl = p1
+        p0_ctrl = self._second_prev_point if self._second_prev_point is not None else p1_ctrl
+        ex = p2_ctrl[0] - p1_ctrl[0]
+        ey = p2_ctrl[1] - p1_ctrl[1]
+        p3_ctrl = (p2_ctrl[0] + ex, p2_ctrl[1] + ey)
+
+        dist = math.hypot(ex, ey)
         max_gap = getattr(config, "STROKE_MAX_GAP_PX", 6)
+        # At least 2 sub-segments per captured point, more for fast/long
+        # jumps, so quick curved motion never skips points or leaves gaps.
+        steps = max(2, int(dist / max_gap) + 1)
 
-        new_points = []
-        if dist > max_gap:
-            steps = max(2, int(dist / max_gap))
-            for i in range(1, steps + 1):
-                t = i / steps
-                curr = (int(p0[0] + dx * t), int(p0[1] + dy * t))
-                new_points.append(curr)
-        else:
-            new_points.append(clamped)
+        prev_draw = p1_ctrl
+        for i in range(1, steps + 1):
+            t = i / steps
+            curr = self._catmull_rom_point(p0_ctrl, p1_ctrl, p2_ctrl, p3_ctrl, t)
+            cv2.line(self._canvas, prev_draw, curr, self.brush_color, self.brush_size, cv2.LINE_AA)
+            prev_draw = curr
 
-        prev = p0
-        for pt in new_points:
-            cv2.line(self._canvas, prev, pt, self.brush_color, self.brush_size, cv2.LINE_AA)
-            prev = pt
-
-        self._stroke_points.extend(new_points)
+        self._stroke_points.append(clamped)
+        self._second_prev_point = p1_ctrl
         self._prev_point = clamped
+
+    @staticmethod
+    def _catmull_rom_point(
+        p0: Tuple[int, int], p1: Tuple[int, int],
+        p2: Tuple[int, int], p3: Tuple[int, int], t: float,
+    ) -> Tuple[int, int]:
+        """Evaluate a centripetal-style (uniform) Catmull-Rom spline at t in [0,1]
+        between p1 and p2, using p0/p3 as tangent control points. Lightweight
+        (closed-form, no extra captured points needed) so it adds no latency."""
+        t2 = t * t
+        t3 = t2 * t
+        x = 0.5 * (
+            (2 * p1[0])
+            + (-p0[0] + p2[0]) * t
+            + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2
+            + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3
+        )
+        y = 0.5 * (
+            (2 * p1[1])
+            + (-p0[1] + p2[1]) * t
+            + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2
+            + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3
+        )
+        return int(x), int(y)
 
     def _erase_at(self, center: Tuple[int, int]) -> None:
         """Erase a circle at center with radius = eraser_size // 2."""
@@ -475,8 +547,20 @@ class DrawingCanvas:
         """
         output = frame.copy()
         x_start = sidebar_width
+
+        # Apply pan offset: shift the canvas buffer before compositing so
+        # panning never mutates stroke coordinates, only the displayed view.
+        if self.pan_offset[0] != 0 or self.pan_offset[1] != 0:
+            M = np.float32([[1, 0, self.pan_offset[0]], [0, 1, self.pan_offset[1]]])
+            shown_canvas = cv2.warpAffine(
+                self._canvas, M, (self.width, self.height),
+                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
+            )
+        else:
+            shown_canvas = self._canvas
+
         roi = output[:, x_start:]
-        canvas_roi = self._canvas[:, x_start:]
+        canvas_roi = shown_canvas[:, x_start:]
 
         # Additive blend: coloured strokes glow over the camera feed
         mask = cv2.cvtColor(canvas_roi, cv2.COLOR_BGR2GRAY)

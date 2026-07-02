@@ -15,6 +15,7 @@ Changes from v1.2
 
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -25,6 +26,7 @@ import numpy as np
 
 import config
 from app.gesture_detector import GESTURE_LABELS, Gesture
+from app.event_bus import EventBus, EventType
 
 # ---------------------------------------------------------------------------
 # Design tokens (BGR throughout)
@@ -70,7 +72,8 @@ class StartupResult:
 class UIRenderer:
     """Draws all non-canvas UI chrome onto the output frame."""
 
-    def __init__(self) -> None:
+    def __init__(self, event_bus: EventBus) -> None:
+        self.event_bus    = event_bus
         self._fps         = 0.0
         self._frame_count = 0
         self._fps_timer   = time.time()
@@ -91,13 +94,6 @@ class UIRenderer:
         self._settings_toggle_rect = (0,0,0,0)
         self._shape_recognition_enabled: bool = True
 
-        # Callbacks – set by main.py via register_*
-        self._cb_new:       Optional[Callable] = None
-        self._cb_open:      Optional[Callable] = None
-        self._cb_save:      Optional[Callable] = None
-        self._cb_save_as:   Optional[Callable] = None
-        self._cb_brush_size: Optional[Callable[[int], None]] = None
-        self._cb_shape_recognition: Optional[Callable[[bool], None]] = None
         self._camera_mode   = config.CAMERA_MODE_DARK_OVERLAY
 
         # Vignette mask is expensive to compute; cache it per frame size
@@ -108,32 +104,7 @@ class UIRenderer:
     # Public registration hooks (called by main.py)
     # ------------------------------------------------------------------
 
-    def register_callbacks(
-        self,
-        on_new:      Callable,
-        on_open:     Callable,
-        on_save:     Callable,
-        on_save_as:  Callable,
-        on_brush_size: Callable[[int], None],
-        on_shape_recognition: Optional[Callable[[bool], None]] = None,
-        on_recent: Optional[Callable] = None,
-        on_export: Optional[Callable] = None,
-        on_help: Optional[Callable] = None,
-        on_about: Optional[Callable] = None,
-        on_settings: Optional[Callable] = None,
-    ) -> None:
-        self._cb_new       = on_new
-        self._cb_open      = on_open
-        self._cb_save      = on_save
-        self._cb_save_as   = on_save_as
-        self._cb_brush_size = on_brush_size
-        self._cb_shape_recognition = on_shape_recognition
-        self._cb_recent    = on_recent
-        self._cb_export    = on_export
-        self._cb_help      = on_help
-        self._cb_about     = on_about
-        self._cb_settings  = on_settings
-
+    # Callbacks handled by EventBus
     def set_camera_mode(self, mode: str) -> None:
         self._camera_mode = mode
 
@@ -870,8 +841,7 @@ class UIRenderer:
                     config.save_settings(settings)
                     state = "ON" if self._shape_recognition_enabled else "OFF"
                     self.flash_message(f"Shape Recognition {state}")
-                    if self._cb_shape_recognition:
-                        self._cb_shape_recognition(self._shape_recognition_enabled)
+                    self.event_bus.publish(EventType.SHAPE_RECOGNITION_TOGGLED, self._shape_recognition_enabled)
                     return
                 # Close button
                 cx1, cy1, cx2, cy2 = self._settings_close_rect
@@ -918,32 +888,18 @@ class UIRenderer:
         new_size = int(2 + prop * (40 - 2))
         canvas_obj.brush_size = new_size
         canvas_obj.eraser_size = new_size   # mirror to eraser
-        if self._cb_brush_size:
-            self._cb_brush_size(new_size)
+        self.event_bus.publish(EventType.BRUSH_SIZE_CHANGED, new_size)
 
     def _dispatch_topbar(self, label: str) -> None:
-        if label == "New":
-            if self._cb_new:
-                self._cb_new()
-        elif label == "Open":
-            if self._cb_open:
-                self._cb_open()
-        elif label == "Save":
-            if self._cb_save:
-                self._cb_save()
-        elif label == "Save As":
-            if self._cb_save_as:
-                self._cb_save_as()
-        elif label == "Settings":
-            if getattr(self, "_cb_settings", None): self._cb_settings()
-        elif label == "Recent":
-            if getattr(self, "_cb_recent", None): self._cb_recent()
-        elif label == "Export":
-            if getattr(self, "_cb_export", None): self._cb_export()
-        elif label == "Help":
-            if getattr(self, "_cb_help", None): self._cb_help()
-        elif label == "About":
-            if getattr(self, "_cb_about", None): self._cb_about()
+        if label == "New": self.event_bus.publish(EventType.WORKSPACE_NEW)
+        elif label == "Open": self.event_bus.publish(EventType.WORKSPACE_OPEN)
+        elif label == "Save": self.event_bus.publish(EventType.WORKSPACE_SAVE)
+        elif label == "Save As": self.event_bus.publish(EventType.WORKSPACE_SAVE_AS)
+        elif label == "Settings": self.event_bus.publish(EventType.SETTINGS_OPEN)
+        elif label == "Recent": self.event_bus.publish(EventType.WORKSPACE_SHOW_RECENT)
+        elif label == "Export": self.event_bus.publish(EventType.WORKSPACE_EXPORT)
+        elif label == "Help": self.event_bus.publish(EventType.HELP_REQUESTED)
+        elif label == "About": self.event_bus.publish(EventType.ABOUT_REQUESTED)
 
     # ------------------------------------------------------------------
     # Frame-level render (main loop)
@@ -958,6 +914,18 @@ class UIRenderer:
         hand_detected: bool,
         cursor_pos: Optional[Tuple[int, int]] = None,
         eraser_size: int = config.ERASER_SIZE,
+        confidence: float = 0.0,
+        finger_states: Optional[dict] = None,
+        app_mode: str = "Idle",
+        raw_pos: Optional[Tuple[int, int]] = None,
+        velocity: Tuple[float, float] = (0.0, 0.0),
+        raw_gesture: str = "NONE",
+        stroke_active: bool = False,
+        stroke_id: int = 0,
+        lost_frame_counter: int = 0,
+        prev_gesture_name: str = "NONE",
+        pinch_distance: float = 0.0,
+        selected_object: str = "None",
     ) -> np.ndarray:
         self._update_fps()
         output = frame.copy()
@@ -965,14 +933,86 @@ class UIRenderer:
         self._draw_sidebar(output, brush_color, brush_size, gesture, hand_detected)
         self._draw_topbar(output)
         self._draw_vignette(output)
+        
+        if raw_pos:
+            cv2.circle(output, raw_pos, 4, (200, 200, 200), 1)
 
-        if cursor_pos and gesture in (Gesture.POINT, Gesture.PINCH, Gesture.FIST):
-            self._draw_cursor(output, cursor_pos, gesture, brush_color, eraser_size)
-
-
+        if cursor_pos:
+            self._draw_cursor(output, cursor_pos, gesture, brush_color, eraser_size, confidence)
 
         self._draw_toasts(output)
         return output
+
+    def _draw_debug_panel(self, frame, gesture, confidence, finger_states, app_mode, velocity,
+                          raw_gesture, stroke_active, stroke_id, lost_frame_counter,
+                          prev_gesture_name, pinch_distance, selected_object, hand_detected):
+        """Draws the gesture debugging panel at the bottom right."""
+        h, w = frame.shape[:2]
+        
+        # Panel dimensions
+        pad = 15
+        panel_w = 260
+        panel_h = 300
+        x = w - panel_w - pad
+        y = h - panel_h - pad
+        
+        # Background
+        self._filled_rounded_rect(frame, x, y, x + panel_w, y + panel_h, 8, BG_CARD)
+        cv2.rectangle(frame, (x, y), (x + panel_w, y + panel_h), DIVIDER, 1)
+        
+        # Title
+        self._put_text(frame, "DEBUG MODE", (x + 10, y + 20), 0.4, ACCENT, 1, font=FONT_BOLD)
+        
+        # Mode & Tracking
+        self._put_text(frame, f"Mode: {app_mode}", (x + 10, y + 45), 0.4, TEXT_PRIMARY, 1)
+        self._put_text(frame, f"Tracking: {hand_detected}", (x + 130, y + 45), 0.4, TEXT_PRIMARY, 1)
+        
+        # Gestures
+        self._put_text(frame, f"Raw: {raw_gesture}", (x + 10, y + 65), 0.4, TEXT_PRIMARY, 1)
+        self._put_text(frame, f"Prev: {prev_gesture_name}", (x + 130, y + 65), 0.4, TEXT_PRIMARY, 1)
+        self._put_text(frame, f"Stab: {gesture.name}", (x + 10, y + 85), 0.4, TEXT_PRIMARY, 1)
+        
+        # Velocity & Pinch
+        vx, vy = velocity
+        speed = math.hypot(vx, vy)
+        self._put_text(frame, f"Vel: {speed:.1f} px/s", (x + 10, y + 105), 0.4, TEXT_PRIMARY, 1)
+        self._put_text(frame, f"Pinch: {pinch_distance:.2f}", (x + 130, y + 105), 0.4, TEXT_PRIMARY, 1)
+        
+        # Stroke Persistence
+        self._put_text(frame, f"Drawing: {stroke_active}", (x + 10, y + 125), 0.4, TEXT_PRIMARY, 1)
+        color = (0, 0, 255) if lost_frame_counter > 0 else TEXT_PRIMARY
+        self._put_text(frame, f"Lost Frm: {lost_frame_counter}", (x + 130, y + 125), 0.4, color, 1)
+        
+        self._put_text(frame, f"StrokeID: {stroke_id}", (x + 10, y + 145), 0.4, TEXT_PRIMARY, 1)
+        self._put_text(frame, f"Sel: {selected_object}", (x + 10, y + 165), 0.4, TEXT_PRIMARY, 1)
+        
+        # Confidence Bar
+        conf_y = y + 190
+        self._put_text(frame, "Conf:", (x + 10, conf_y + 10), 0.4, TEXT_SECONDARY, 1)
+        bar_x = x + 50
+        bar_w = panel_w - 60
+        cv2.rectangle(frame, (bar_x, conf_y), (bar_x + bar_w, conf_y + 10), BG_DEEP, -1)
+        cv2.rectangle(frame, (bar_x, conf_y), (bar_x + int(bar_w * confidence), conf_y + 10), ACCENT, -1)
+        cv2.rectangle(frame, (bar_x, conf_y), (bar_x + bar_w, conf_y + 10), DIVIDER, 1)
+        
+        # Finger States
+        fy = conf_y + 30
+        self._put_text(frame, "Fingers:", (x + 10, fy), 0.4, TEXT_SECONDARY, 1)
+        
+        fingers = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
+        fx = x + 10
+        fy += 15
+        spacing = (panel_w - 20) / 5
+        
+        for i, finger in enumerate(fingers):
+            state = finger_states.get(finger, False)
+            color = ACCENT if state else TEXT_MUTED
+            # Draw circle indicator
+            cx = int(fx + i * spacing + spacing / 2)
+            cv2.circle(frame, (cx, fy), 5, color, -1)
+            cv2.circle(frame, (cx, fy), 5, DIVIDER, 1)
+            # Draw initial
+            self._put_text_centered(frame, finger[0], cx, fy + 12, 0.35, TEXT_SECONDARY, 1)
 
     def flash_message(self, text: str, duration_sec: float = 2.5) -> None:
         self._toasts = deque(t for t in self._toasts if t.text != text)
@@ -1190,8 +1230,33 @@ class UIRenderer:
 
         y = self._draw_card_header(frame, "GESTURE STATUS", y)
         y = self._draw_gesture_card(frame, gesture, hand_detected, y)
+        
+        y = self._draw_card_header(frame, "GESTURE GUIDE", y)
+        y = self._draw_gesture_legend(frame, y)
 
         self._draw_hand_indicator(frame, hand_detected, h)
+
+    def _draw_gesture_legend(self, frame: np.ndarray, y: int) -> int:
+        sw = config.SIDEBAR_WIDTH
+        legend = [
+            ("Index Finger", "Brush"),
+            ("Pinch", "Move"),
+            ("Fist", "Pause"),
+            ("Open Palm", "Clear"),
+            ("Peace Sign", "Color")
+        ]
+        
+        card_h = len(legend) * 22 + 16
+        self._filled_rounded_rect(frame, 12, y, sw - 12, y + card_h, 8, BG_CARD)
+        cv2.rectangle(frame, (12, y), (sw - 12, y + card_h), DIVIDER, 1)
+
+        ty = y + 20
+        for gest, action in legend:
+            self._put_text(frame, gest, (22, ty), 0.38, TEXT_MUTED, 1)
+            self._put_text(frame, action, (sw - 22, ty), 0.38, TEXT_PRIMARY, 1, align_right=True, right_x=sw - 22)
+            ty += 22
+
+        return y + card_h + 16
 
     def _draw_card_header(self, frame: np.ndarray, label: str, y: int) -> int:
         sw = config.SIDEBAR_WIDTH
@@ -1349,28 +1414,39 @@ class UIRenderer:
         gesture: Gesture,
         brush_color: Tuple[int, int, int],
         eraser_size: int = config.ERASER_SIZE,
+        confidence: float = 0.0,
     ) -> None:
         x, y = pos
-        if gesture == Gesture.FIST:
-            r = eraser_size // 2
-            cv2.circle(frame, (x, y), r, (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.circle(frame, (x, y), max(1, r // 4), (200, 200, 200), 1, cv2.LINE_AA)
-            tick = 6
-            for dx_, dy_ in [(r+3,0),(-(r+3),0),(0,r+3),(0,-(r+3))]:
-                cv2.line(frame, (x+dx_, y+dy_),
-                         (x+dx_+(tick if dx_>0 else (-tick if dx_<0 else 0)),
-                          y+dy_+(tick if dy_>0 else (-tick if dy_<0 else 0))),
-                         (255,255,255), 1, cv2.LINE_AA)
-        elif gesture == Gesture.POINT:
-            size = 10
-            cv2.circle(frame, (x, y), size, TEXT_MUTED, 1, cv2.LINE_AA)
-            cv2.line(frame, (x-size-4,y),(x-3,y), TEXT_MUTED, 1, cv2.LINE_AA)
-            cv2.line(frame, (x+3,y),(x+size+4,y), TEXT_MUTED, 1, cv2.LINE_AA)
-            cv2.line(frame, (x,y-size-4),(x,y-3), TEXT_MUTED, 1, cv2.LINE_AA)
-            cv2.line(frame, (x,y+3),(x,y+size+4), TEXT_MUTED, 1, cv2.LINE_AA)
-        else:
+        
+        tool_name, tool_color = self._gesture_to_tool(gesture)
+        # Tool name label
+        self._put_text(frame, tool_name, (x + 15, y - 10), 0.5, tool_color, 1, font=FONT_BOLD)
+
+        # Simple, stable dot for the cursor
+        cv2.circle(frame, (x, y), 3, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, (x, y), 4, (0, 0, 0), 1, cv2.LINE_AA)
+        
+        # Add tool-specific halo
+        if gesture == Gesture.POINT:
+            # Drawing indicator
             cv2.circle(frame, (x, y), 12, brush_color, 1, cv2.LINE_AA)
-            cv2.circle(frame, (x, y), 2,  brush_color, -1, cv2.LINE_AA)
+        elif gesture == Gesture.FIST:
+            # Pause indicator
+            cv2.circle(frame, (x, y), 8, (150, 150, 150), 2, cv2.LINE_AA)
+            cv2.line(frame, (x-3, y-4), (x-3, y+4), (150, 150, 150), 2, cv2.LINE_AA)
+            cv2.line(frame, (x+3, y-4), (x+3, y+4), (150, 150, 150), 2, cv2.LINE_AA)
+        elif gesture == Gesture.PINCH:
+            # Grab indicator
+            ACCENT = (140, 200, 255) # BGR
+            cv2.circle(frame, (x, y), 10, ACCENT, 1, cv2.LINE_AA)
+        elif gesture == Gesture.OPEN_PALM:
+            # Progress ring for clear countdown
+            radius = 16
+            cv2.circle(frame, (x, y), radius, (50, 50, 50), 2, cv2.LINE_AA)
+            if confidence > 0:
+                angle = int(360 * confidence)
+                axes = (radius, radius)
+                cv2.ellipse(frame, (x, y), axes, -90, 0, angle, (50, 80, 220), 3, cv2.LINE_AA)
 
     # ------------------------------------------------------------------
     # Vignette
@@ -1485,9 +1561,9 @@ class UIRenderer:
 
     def _gesture_to_tool(self, gesture):
         mapping = {
-            Gesture.PINCH:     ("Brush",  ACCENT),
-            Gesture.FIST:      ("Eraser", (100, 100, 220)),
-            Gesture.POINT:     ("Hover",  TEXT_SECONDARY),
+            Gesture.PINCH:     ("Move",   ACCENT),
+            Gesture.FIST:      ("Pause",  (100, 100, 220)),
+            Gesture.POINT:     ("Brush",  (180, 230, 20)),
             Gesture.PEACE:     ("Color",  (100, 200, 255)),
             Gesture.OPEN_PALM: ("Clear",  (50, 80, 220)),
         }

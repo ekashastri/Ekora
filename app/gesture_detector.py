@@ -1,38 +1,42 @@
 """
-Gesture detector module – interprets hand landmarks as user intents.
-v1.5 – Robust Gesture State Machine + Safe Palm Gesture
+Gesture detector module - interprets hand landmarks as user intents.
+v2.0 - Simplified Production Gesture System
 
-Changes vs v1.4
----------------
-* Explicit state machine (IDLE → HOVER → DRAWING → ERASING →
-  COLOR_SELECTION → PALM_CONFIRMATION → CLEAR) replaces frame-by-frame
-  decisions.  Transitions are debounced: a gesture must be seen for
-  GESTURE_DEBOUNCE_FRAMES consecutive frames before the state changes,
-  so a single noisy frame cannot flip the active state.
+This version replaces the previous multi-gesture, multi-state mapping
+with a small, predictable set of four gestures, each tied to exactly
+one user-facing action:
 
-* Safe palm gesture: the canvas is cleared ONLY when:
-    1. ALL five fingers are fully extended.
-    2. No active drawing stroke is in progress.
-    3. The gesture is stable for PALM_HOLD_DURATION seconds.
-    4. PALM_CONFIDENCE_RATIO of frames in that window all agree.
-    5. Hand velocity stays below PALM_MAX_VELOCITY (normalised).
+  POINT      (one index finger)        -> Draw continuously
+  FIST       (closed fist)             -> Pause drawing (freeze stroke)
+  OPEN_PALM  (five fingers, held)      -> Clear canvas (once per pose)
+  PINCH      (thumb + index touching)  -> Move / drag the entire drawing
 
-Gesture catalogue (unchanged from v1.4)
----------------------------------------
-  PINCH       Thumb tip + index tip close together  →  Draw on canvas
-  POINT       Index extended, others curled         →  Move cursor (hover)
-  OPEN_PALM   All 5 fingers extended + stable       →  Clear canvas (safe)
-  FIST        All fingers curled                    →  Eraser mode
-  PEACE       Index + middle extended               →  Cycle brush colour
+Design goals
+------------
+* Index-finger drawing starts the instant the pose is seen (zero
+  confirmation delay) and stops the instant the pose changes.
+* A closed fist freezes the stroke in place (no new points are added)
+  but cursor tracking keeps running; returning to the index-finger
+  pose resumes the SAME stroke immediately, with no gap or restart.
+* The open-palm "clear" gesture requires a short, stable hold
+  (PALM_HOLD_DURATION, ~200-300ms) before it fires, and fires only
+  once per pose - the user must lower the palm before it can clear
+  again. This prevents accidental wipes from a single noisy frame.
+* Pinch (thumb + index) drags the whole drawing. It never creates new
+  strokes, and only does anything once the canvas is non-empty.
+* All non-instant transitions (palm, pinch) use consecutive-frame
+  confirmation (GESTURE_DEBOUNCE_FRAMES, 3-5 frames) so one noisy
+  frame can't flip the active gesture. If tracking is briefly lost
+  (a "ghost" frame) the previously confirmed gesture is held steady
+  rather than dropping to NONE.
 """
 
 from __future__ import annotations
 
 import math
 import time
-from collections import deque
 from enum import Enum, auto
-from typing import Deque, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import config
 from app.hand_tracker import (
@@ -56,76 +60,60 @@ from app.hand_tracker import (
 
 
 class Gesture(Enum):
-    """Recognised hand gestures mapped to application actions."""
+    """
+    Recognised hand gestures mapped to application actions.
+
+    NOTE: enum members are kept compatible with the rest of the app
+    (app/ui.py, main.py) which import Gesture by name. PEACE and
+    PALM_DETECTED are retained only so existing imports/dict lookups
+    elsewhere don't break; this detector never emits them.
+    """
     NONE  = auto()
-    PINCH = auto()       # Drawing
-    POINT = auto()       # Hover / cursor only
-    OPEN_PALM = auto()   # Clear canvas (after safe confirmation)
-    FIST  = auto()       # Eraser
-    PEACE = auto()       # Cycle colour
-    PALM_DETECTED = auto()
+    PINCH = auto()       # Move / drag the whole drawing
+    POINT = auto()       # Draw
+    OPEN_PALM = auto()   # Clear canvas (after brief stable hold)
+    FIST  = auto()       # Pause drawing
+    PEACE = auto()       # Unused in v2 (kept for compatibility)
+    PALM_DETECTED = auto()  # Unused in v2 (kept for compatibility)
 
 
 # Human-readable labels for the HUD
 GESTURE_LABELS = {
     Gesture.NONE:      "Idle",
-    Gesture.PINCH:     "Drawing",
-    Gesture.POINT:     "Hover",
-    Gesture.OPEN_PALM: "Clearing Canvas...",
-    Gesture.FIST:      "Erase",
-    Gesture.PEACE:     "Peace – Next Color",
-    Gesture.PALM_DETECTED: "Palm Detected",
-}
-
-
-# Internal state machine states
-class _State(Enum):
-    IDLE             = auto()
-    HOVER            = auto()
-    DRAWING          = auto()
-    ERASING          = auto()
-    COLOR_SELECTION  = auto()
-    PALM_CONFIRMATION = auto()
-    CLEAR            = auto()
-
-
-# Map state → public Gesture (what the rest of the app sees)
-_STATE_TO_GESTURE = {
-    _State.IDLE:              Gesture.NONE,
-    _State.HOVER:             Gesture.POINT,
-    _State.DRAWING:           Gesture.PINCH,
-    _State.ERASING:           Gesture.FIST,
-    _State.COLOR_SELECTION:   Gesture.PEACE,
-    _State.PALM_CONFIRMATION: Gesture.PALM_DETECTED,
-    _State.CLEAR:             Gesture.OPEN_PALM,
+    Gesture.PINCH:     "Moving Drawing",
+    Gesture.POINT:     "Drawing",
+    Gesture.OPEN_PALM: "Clearing...",
+    Gesture.FIST:      "Paused",
+    Gesture.PEACE:     "Palette",
+    Gesture.PALM_DETECTED: "Clearing...",
 }
 
 
 class GestureDetector:
     """
-    Stateful gesture classifier with an explicit finite-state machine.
+    Stateful gesture classifier for the simplified v2 interaction model.
 
-    The palm-clear gesture is gated by a multi-condition safety check
-    (duration, velocity, confidence, no active stroke) to eliminate
-    false positives.
+    Four gestures only:
+        POINT (draw) / FIST (pause) / OPEN_PALM (clear) / PINCH (move)
+
+    Draw and Pause are instantaneous (no confirmation delay) so
+    handwriting feels natural and pausing/resuming is immediate.
+    Clear and Move are gated by short consecutive-frame confirmation
+    to avoid accidental triggers from single noisy frames.
     """
 
     def __init__(self) -> None:
-        self._state: _State = _State.IDLE
-        self._drawing_last_seen_time: float = 0.0
+        self._gesture: Gesture = Gesture.NONE
 
         # --- Debounce: candidate raw gesture must be stable for N frames ---
-        self._candidate_raw: Optional[str] = None   # raw gesture name string
+        self._candidate_raw: Optional[str] = None
         self._candidate_frames: int = 0
 
-        # --- Palm safety tracking ---
-        self._palm_start_time: float = 0.0
-        self._palm_frame_count: int  = 0    # total frames in palm window
-        self._palm_ok_count: int     = 0    # frames where all 5 fingers up
-        self._palm_last_pos: Optional[Tuple[float, float]] = None  # wrist pos
-
-        # --- Post-clear cooldown ---
-        self._clear_cooldown: float = 0.0   # epoch time after which palm allowed
+        # --- Open-palm hold tracking ---
+        self._palm_hold_start: Optional[float] = None
+        self._palm_armed: bool = True   # re-armed once the pose is left
+        self._is_pinching = False
+        self.last_pinch_distance = 0.0
 
         # --- Active stroke flag (set by main.py via property) ---
         self._stroke_active: bool = False
@@ -146,9 +134,9 @@ class GestureDetector:
         self,
         hand: HandLandmarks,
         frame_shape: Tuple[int, int],
-    ) -> Gesture:
+    ) -> Tuple[Gesture, float, dict]:
         """
-        Classify the current hand pose via the state machine.
+        Classify the current hand pose.
 
         Parameters
         ----------
@@ -157,154 +145,176 @@ class GestureDetector:
 
         Returns
         -------
-        Gesture enum value reflecting the *current stable state*.
+        Tuple containing:
+        - Gesture enum value reflecting the current confirmed gesture.
+        - Confidence float (0.0 to 1.0)
+        - Finger states dict
         """
         lm = hand.landmarks
         h, w = frame_shape
 
-        # Normalise landmarks to 0–1
+        # Normalise landmarks to 0-1
         norm: List[Tuple[float, float]] = [(x / w, y / h) for x, y in lm]
 
-        # Ghost frames (persistence window) keep the current state but
-        # do NOT advance palm confirmation or debounce.
-        if hand.is_ghost:
-            return _STATE_TO_GESTURE[self._state]
-
-        raw = self._raw_gesture(norm)
-        self._update_state(raw, norm)
-        return _STATE_TO_GESTURE[self._state]
+        raw, finger_states = self._raw_gesture(norm)
+        confidence = self._update_gesture(raw)
+        return self._gesture, confidence, finger_states
 
     # ------------------------------------------------------------------
     # Raw (single-frame, un-debounced) gesture classification
     # ------------------------------------------------------------------
 
-    def _raw_gesture(self, norm: List[Tuple[float, float]]) -> str:
-        """Return a raw gesture name from normalised landmarks."""
+    def _raw_gesture(self, norm: List[Tuple[float, float]]) -> Tuple[str, dict]:
+        """Return a raw gesture name and finger states from normalised landmarks."""
+        thumb_up  = self._thumb_extended(norm)
         index_up  = self._finger_extended(norm, INDEX_TIP,  INDEX_PIP,  INDEX_DIP,  WRIST)
         middle_up = self._finger_extended(norm, MIDDLE_TIP, MIDDLE_PIP, MIDDLE_DIP, WRIST)
         ring_up   = self._finger_extended(norm, RING_TIP,   RING_PIP,   RING_DIP,   WRIST)
         pinky_up  = self._finger_extended(norm, PINKY_TIP,  PINKY_PIP,  PINKY_DIP,  WRIST)
-        thumb_up  = self._thumb_extended(norm)
+        
+        finger_states = {
+            "Thumb": thumb_up,
+            "Index": index_up,
+            "Middle": middle_up,
+            "Ring": ring_up,
+            "Pinky": pinky_up
+        }
+        
+        # Pinch (thumb + index touching) takes priority -> Move gesture
+        # Normalise pinch distance to hand size (wrist to index PIP)
+        hand_size = self._distance(norm[WRIST], norm[INDEX_PIP])
+        pinch_dist_raw = self._distance(norm[THUMB_TIP], norm[INDEX_TIP])
+        self.last_pinch_distance = pinch_dist_raw / (hand_size + 1e-6)
 
-        # Pinch overrides everything (drawing gesture)
-        pinch_dist = self._distance(norm[THUMB_TIP], norm[INDEX_TIP])
-        if pinch_dist < config.PINCH_THRESHOLD:
-            return "PINCH"
+        PINCH_START_THRESH = 0.15
+        PINCH_RELEASE_THRESH = 0.30
 
-        # All five fingers up → palm candidate
-        if index_up and middle_up and ring_up and pinky_up and thumb_up:
-            return "PALM"
+        if self._is_pinching:
+            if self.last_pinch_distance > PINCH_RELEASE_THRESH:
+                self._is_pinching = False
+        else:
+            if self.last_pinch_distance < PINCH_START_THRESH:
+                self._is_pinching = True
 
-        # Peace: index + middle up, others down
+        if self._is_pinching:
+            return "PINCH", finger_states
+
+        # Open Palm (all 5 fingers extended) -> Clear
+        if thumb_up and index_up and middle_up and ring_up and pinky_up:
+            return "PALM", finger_states
+
+        # Gesture Locking: If currently drawing, ignore transitional noise
+        if self._stroke_active and index_up:
+            return "POINT", finger_states
+
+        # Fist (no fingers extended) -> Pause
+        if not index_up and not middle_up and not ring_up and not pinky_up:
+            return "FIST", finger_states
+
+        # Peace (index + middle extended, ring + pinky curled) -> Palette
         if index_up and middle_up and not ring_up and not pinky_up:
-            return "PEACE"
+            return "PEACE", finger_states
 
-        # Fist: no fingers extended
-        extended = sum([index_up, middle_up, ring_up, pinky_up, thumb_up])
-        if extended == 0:
-            return "FIST"
-
-        # Point: only index
+        # Point: only the index finger extended -> Draw
         if index_up and not middle_up and not ring_up and not pinky_up:
-            return "POINT"
+            return "POINT", finger_states
 
-        return "NONE"
+        return "NONE", finger_states
 
     # ------------------------------------------------------------------
-    # State machine transition
+    # Gesture confirmation / transition logic
     # ------------------------------------------------------------------
 
-    def _update_state(self, raw: str, norm: List[Tuple[float, float]]) -> None:
-        """Advance the state machine given the raw gesture and landmarks."""
+    def _update_gesture(self, raw: str) -> float:
+        """Advance the confirmed gesture given the latest raw reading and return confidence."""
         debounce_n = getattr(config, "GESTURE_DEBOUNCE_FRAMES", 3)
-        now = time.monotonic()
 
-        # --- Debounce: count consecutive frames of the same raw gesture ---
+        # --- Debounce bookkeeping: consecutive frames of the same raw value ---
         if raw == self._candidate_raw:
             self._candidate_frames += 1
         else:
-            self._candidate_raw    = raw
+            self._candidate_raw = raw
             self._candidate_frames = 1
 
-        confirmed = self._candidate_frames >= debounce_n
+        confirmed_n_frames = self._candidate_frames >= debounce_n
+        
+        confidence = min(1.0, self._candidate_frames / max(1, debounce_n))
 
         # -----------------------------------------------------------------
-        # PALM_CONFIRMATION state: collect evidence before clearing canvas
+        # Re-arm the palm/clear trigger as soon as the palm pose is left,
+        # so the next full palm hold can clear again.
         # -----------------------------------------------------------------
-        if self._state == _State.PALM_CONFIRMATION:
-            if raw == "PALM":
-                self._palm_frame_count += 1
-                self._palm_ok_count    += 1
-
-                if self._stroke_active:
-                    # Stroke active — restart confirmation
-                    self._begin_palm_confirmation(norm)
-                    return
-
-                min_ratio = getattr(config, "PALM_CONFIDENCE_RATIO", 0.80)
-                ratio = self._palm_ok_count / max(1, self._palm_frame_count)
-
-                # 6 frames + 3 debounce frames = 9 frames total (~300 ms at 30 FPS)
-                if (
-                    self._palm_frame_count >= 6
-                    and ratio >= min_ratio
-                    and now >= self._clear_cooldown
-                ):
-                    # All conditions met → transition to CLEAR
-                    self._state = _State.CLEAR
-                    self._clear_cooldown = now + 1.5  # 1.5 s cooldown prevent loop
-                    return
-            else:
-                # Palm lost during confirmation — abort, go back to IDLE
-                self._state = _State.IDLE
-            return
+        if raw != "PALM":
+            self._palm_armed = True
+            self._palm_hold_start = None
 
         # -----------------------------------------------------------------
-        # CLEAR: emit once then auto-reset to IDLE
+        # OPEN_PALM -> Clear. Requires a short stable hold (1 second)
+        # before firing, and fires only once until the pose is released.
         # -----------------------------------------------------------------
-        if self._state == _State.CLEAR:
-            self._state = _State.IDLE
-            return
+        if raw == "PALM":
+            now = time.monotonic()
+            if self._palm_hold_start is None:
+                self._palm_hold_start = now
+
+            hold_duration = 1.0  # Explicitly 1.0s as per requirements
+            elapsed = now - self._palm_hold_start
+            
+            confidence = min(1.0, elapsed / hold_duration)
+
+            if elapsed >= hold_duration and self._palm_armed:
+                self._gesture = Gesture.OPEN_PALM
+                self._palm_armed = False  # don't fire again until pose is left
+            # While still building up the hold (or already fired this pose),
+            # keep showing the palm-clearing feedback state rather than
+            # snapping back to the previous gesture.
+            elif not self._palm_armed:
+                self._gesture = Gesture.OPEN_PALM
+            return confidence
 
         # -----------------------------------------------------------------
-        # Immediate transitions for zero-latency drawing and hovering
+        # PEACE -> Open colour palette. Immediate, zero-delay like POINT
+        # and FIST, so the palette appears the instant the pose is seen.
+        # -----------------------------------------------------------------
+        if raw == "PEACE":
+            self._gesture = Gesture.PEACE
+            return confidence
+
+        # -----------------------------------------------------------------
+        # POINT -> Draw. Immediate, zero-delay: drawing must start the
+        # instant the pose is seen and stop the instant it changes.
+        # -----------------------------------------------------------------
+        if raw == "POINT":
+            self._gesture = Gesture.POINT
+            return confidence
+
+        # -----------------------------------------------------------------
+        # FIST -> Pause. Also immediate, so pausing/resuming feels instant
+        # and a stroke can resume the moment the index finger returns.
+        # -----------------------------------------------------------------
+        if raw == "FIST":
+            self._gesture = Gesture.FIST
+            return confidence
+
+        # -----------------------------------------------------------------
+        # PINCH -> Move drawing. Small debounce to avoid a momentary
+        # finger-tap from yanking the whole drawing around.
         # -----------------------------------------------------------------
         if raw == "PINCH":
-            self._drawing_last_seen_time = now
-            self._state = _State.DRAWING
-            return
-
-        is_drawing_cooldown = (self._state == _State.DRAWING) and (now - getattr(self, "_drawing_last_seen_time", 0) < 0.20)
-        if is_drawing_cooldown and raw in ("NONE", "POINT"):
-            return
-
-        if raw == "POINT":
-            self._state = _State.HOVER
-            return
+            if confirmed_n_frames:
+                self._gesture = Gesture.PINCH
+            return confidence
 
         # -----------------------------------------------------------------
-        # Normal transitions (debounce required to prevent noisy drops)
+        # NONE / Transitional: The user relaxed their hand.
+        # Debounce it slightly to avoid flickering, then drop to idle.
         # -----------------------------------------------------------------
-        if not confirmed:
-            return   # Keep current state until new gesture stabilises
-
-        if raw == "FIST":
-            self._state = _State.ERASING
-        elif raw == "PEACE":
-            self._state = _State.COLOR_SELECTION
-        elif raw == "PALM":
-            if not self._stroke_active and now >= self._clear_cooldown:
-                self._begin_palm_confirmation(norm)
-        else:
-            self._state = _State.IDLE
-
-    def _begin_palm_confirmation(self, norm: List[Tuple[float, float]]) -> None:
-        """Enter PALM_CONFIRMATION state and reset tracking counters."""
-        self._state            = _State.PALM_CONFIRMATION
-        self._palm_start_time  = time.monotonic()
-        self._palm_frame_count = 1
-        self._palm_ok_count    = 1
-        self._palm_last_pos    = norm[WRIST]
+        if raw == "NONE":
+            if confirmed_n_frames:
+                self._gesture = Gesture.NONE
+            return confidence
+            
+        return confidence
 
     # ------------------------------------------------------------------
     # Geometry helpers
@@ -325,28 +335,29 @@ class GestureDetector:
     ) -> bool:
         """
         A finger is "extended" when its tip is farther from the wrist than
-        the PIP joint, measured along the vertical axis (y decreases upward
-        in image coordinates, so smaller y = higher on screen).
-
-        We also verify the tip is above the DIP joint for robustness.
+        the PIP joint. Using Euclidean distance makes this check invariant
+        to hand orientation (rotation).
         """
-        tip_y   = norm[tip_idx][1]
-        pip_y   = norm[pip_idx][1]
-        dip_y   = norm[dip_idx][1]
-        wrist_y = norm[wrist_idx][1]
+        tip = norm[tip_idx]
+        pip = norm[pip_idx]
+        wrist = norm[wrist_idx]
 
-        tip_above_pip = (
-            tip_y < pip_y - config.FINGER_EXTENDED_RATIO * abs(pip_y - wrist_y) * 0.15
-        )
-        tip_above_dip = tip_y < dip_y
-        return tip_above_pip and tip_above_dip
+        dist_tip = math.hypot(tip[0] - wrist[0], tip[1] - wrist[1])
+        dist_pip = math.hypot(pip[0] - wrist[0], pip[1] - wrist[1])
+
+        # For a fully extended finger, the tip is significantly farther from the wrist than the PIP.
+        return dist_tip > dist_pip * 1.1
 
     @staticmethod
     def _thumb_extended(norm: List[Tuple[float, float]]) -> bool:
         """
         Thumb extension is trickier because it moves sideways.
-        We check horizontal spread from the IP joint.
+        We check its distance from the wrist compared to the IP joint.
         """
         tip = norm[THUMB_TIP]
         ip  = norm[THUMB_IP]
-        return abs(tip[0] - ip[0]) > 0.04
+        wrist = norm[WRIST]
+        
+        dist_tip = math.hypot(tip[0] - wrist[0], tip[1] - wrist[1])
+        dist_ip  = math.hypot(ip[0] - wrist[0], ip[1] - wrist[1])
+        return dist_tip > dist_ip

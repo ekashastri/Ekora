@@ -4,7 +4,6 @@ Hand tracker module – MediaPipe Hand Landmarker (Tasks API) with smoothing.
 MediaPipe detects up to 21 3-D landmarks per hand.  This module:
   • Runs inference on each camera frame using the Tasks API (MediaPipe ≥ 0.10).
   • Converts normalised landmarks to pixel coordinates.
-  • Applies exponential smoothing to reduce jitter.
   • Draws the hand skeleton for visual feedback.
 """
 
@@ -15,6 +14,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
+import threading
 
 import cv2
 import mediapipe as mp
@@ -78,11 +78,9 @@ class HandLandmarks:
     ----------
     landmarks : list of (x, y) pixel tuples – length 21
     handedness : 'Left' or 'Right'
-    is_ghost : True when landmarks are inferred (persistence window), not live
     """
     landmarks: List[Tuple[int, int]]
     handedness: str = "Right"
-    is_ghost: bool = False
 
 
 @dataclass
@@ -99,9 +97,6 @@ class HandTracker:
     min_tracking_confidence: float = config.MIN_TRACKING_CONFIDENCE
     _landmarker: vision.HandLandmarker = field(init=False, repr=False)
     _timestamp_ms: int = field(default=0, init=False, repr=False)
-    # v1.5 – stroke persistence
-    _last_hand: Optional[HandLandmarks] = field(default=None, init=False, repr=False)
-    _last_hand_time: float = field(default=0.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         model_path = ensure_model()
@@ -126,13 +121,6 @@ class HandTracker:
         Detect hand landmarks in a BGR frame.
 
         Returns HandLandmarks or None if no hand is detected.
-
-        v1.5 – Stroke persistence:
-        When landmarks are momentarily lost the last known HandLandmarks object
-        is returned for up to STROKE_PERSISTENCE_TIMEOUT seconds so that a brief
-        tracking gap does not break an active stroke.  The caller can check
-        ``hand.is_ghost`` to know that the landmarks are inferred, not live.
-        After the timeout expires we return None and reset smoothing as before.
         """
         h, w = frame_bgr.shape[:2]
 
@@ -146,21 +134,6 @@ class HandTracker:
         result = self._landmarker.detect_for_video(mp_image, self._timestamp_ms)
 
         if not result.hand_landmarks:
-            # --- Stroke persistence: keep last known landmarks briefly ---
-            if (
-                self._last_hand is not None
-                and now - self._last_hand_time < config.STROKE_PERSISTENCE_TIMEOUT
-            ):
-                # Return the ghost copy; do NOT reset smoothing yet
-                ghost = HandLandmarks(
-                    landmarks=list(self._last_hand.landmarks),
-                    handedness=self._last_hand.handedness,
-                    is_ghost=True,
-                )
-                return ghost
-
-            # Timeout elapsed or no previous hand — truly lost
-            self._last_hand = None
             return None
 
         # Use the first detected hand (single-hand drawing mode)
@@ -178,8 +151,6 @@ class HandTracker:
             pixel_landmarks.append((round(raw_x), round(raw_y)))
 
         hand = HandLandmarks(landmarks=pixel_landmarks, handedness=handedness)
-        self._last_hand = hand
-        self._last_hand_time = now
         return hand
 
     def draw_skeleton(
@@ -206,3 +177,55 @@ class HandTracker:
         self._landmarker.close()
 
 
+# ---------------------------------------------------------------------------
+# Threaded Tracker
+# ---------------------------------------------------------------------------
+
+class ThreadedTracker:
+    """
+    Runs MediaPipe inference in a background thread to prevent blocking 
+    the main OpenCV render loop.
+    """
+    def __init__(self, tracker: HandTracker) -> None:
+        self.tracker = tracker
+        self._frame = None
+        self._hand: Optional[HandLandmarks] = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._new_frame_event = threading.Event()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def update_frame(self, frame: np.ndarray) -> None:
+        with self._lock:
+            # Drop frame if one is already being processed to keep latency low
+            self._frame = frame.copy()
+        self._new_frame_event.set()
+
+    def get_latest_hand(self) -> Optional[HandLandmarks]:
+        with self._lock:
+            return self._hand
+
+    def _worker(self) -> None:
+        while not self._stop.is_set():
+            if self._new_frame_event.wait(timeout=0.1):
+                self._new_frame_event.clear()
+                with self._lock:
+                    if self._frame is None:
+                        continue
+                    frame_to_process = self._frame
+                
+                hand = self.tracker.process(frame_to_process)
+                
+                with self._lock:
+                    self._hand = hand
+
+    def close(self) -> None:
+        self._stop.set()
+        self._new_frame_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self.tracker.close()
+
+    def draw_skeleton(self, frame: np.ndarray, hand: HandLandmarks) -> None:
+        self.tracker.draw_skeleton(frame, hand)

@@ -468,3 +468,8 @@ def draw_clean_shape(
         p0, p1 = params["p0"], params["p1"]
         cv2.arrowedLine(canvas, p0, p1, color, t,
                         cv2.LINE_AA, tipLength=0.25)
+                        
+    elif shape_type == "text":
+        scale = params.get("scale", 1.0)
+        cv2.putText(canvas, params.get("text", ""), (params["x"], params["y"]),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, color, t, cv2.LINE_AA)
